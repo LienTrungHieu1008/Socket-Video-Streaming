@@ -2,8 +2,11 @@ from tkinter import *
 import tkinter.messagebox
 from PIL import Image, ImageTk
 import socket
+import time
 import threading
 import io
+import sys
+import traceback
 
 from RtpPacket import RtpPacket
 
@@ -47,6 +50,15 @@ class Client:
         self.frameNbr = 0
         self.teardownAcked = False
         self.listenThread = None
+        self.playEvent = threading.Event()
+        self.stopEvent = threading.Event()
+
+        # --- THÊM BIẾN THỐNG KÊ (STATISTICS) ---
+        self.startTime = 0
+        self.totalBytes = 0       # Tổng số byte nhận được
+        self.totalFrames = 0      # Tổng số frame nhận được
+        self.expectedFrames = 0   # Tổng số frame lẽ ra phải nhận (dựa trên SeqNum)
+        self.lostFrames = 0       # Số frame bị mất\
 
         # GUI
         self.createWidgets()
@@ -88,6 +100,37 @@ class Client:
         self.teardown["command"] = self.handlerTeardown
         self.teardown.grid(row=1, column=3, padx=2, pady=2)
 
+        # --- PHẦN NÂNG CAO: CHỌN ĐỘ PHÂN GIẢI ---
+        # Label hướng dẫn
+        lbl_res = Label(self.master, text="Resolution:", height=2)
+        lbl_res.grid(row=2, column=0, sticky=E, padx=5)
+
+        # Biến lưu lựa chọn
+        self.resolution = StringVar()
+        self.resolution.set(self.fileName) # Mặc định là tên file nhập từ dòng lệnh
+
+        # Radio Button 720p (Cần có file movie_720.Mjpeg trong thư mục)
+        self.btn720 = Radiobutton(self.master, text="720p", variable=self.resolution, value="movie_720.Mjpeg")
+        self.btn720.grid(row=2, column=1, sticky=W)
+
+        # Radio Button 1080p (Cần có file movie_1080.Mjpeg trong thư mục)
+        self.btn1080 = Radiobutton(self.master, text="1080p", variable=self.resolution, value="movie_1080.Mjpeg")
+        self.btn1080.grid(row=2, column=2, sticky=W)
+        
+        # --- THÊM KHU VỰC HIỂN THỊ THÔNG SỐ (STATS) ---
+        # Label hiển thị Băng thông (Bitrate)
+        self.lblRate = Label(self.master, text="Rate: 0 kbps", font=("Helvetica", 10, "bold"))
+        self.lblRate.grid(row=3, column=0, padx=5, pady=5)
+        
+        # Label hiển thị Tổng dữ liệu (Total Data)
+        self.lblBytes = Label(self.master, text="Data: 0 MB", font=("Helvetica", 10))
+        self.lblBytes.grid(row=3, column=1, padx=5, pady=5)
+        
+        # Label hiển thị Tỉ lệ mất gói (Loss)
+        self.lblLoss = Label(self.master, text="Loss: 0%", font=("Helvetica", 10, "bold"), fg="red")
+        self.lblLoss.grid(row=3, column=2, padx=5, pady=5)
+        
+
     # ================== Kết nối RTSP ==================
 
     def connectToServer(self):
@@ -106,52 +149,63 @@ class Client:
 
     def handlerSetup(self):
         """Gửi yêu cầu SETUP."""
-        if self.state != INIT:
-            return
-
-        try:
-            # Tạo UDP socket dùng nhận RTP và bind vào rtpPort
-            self.rtpSocket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.rtpSocket.bind(('', self.rtpPort))
-            self.rtpSocket.settimeout(0.5)  # timeout 0.5s như yêu cầu trong PDF
-        except Exception as e:
-            tkinter.messagebox.Message(
-                self.master,
-                title="RTP Socket Error",
-                message=f"Cannot bind RTP port {self.rtpPort}.\n{e}"
-            ).show()
-            return
-
-        self.sendRtspRequest(SETUP)
+        if self.state == INIT:
+            try:
+                # Tạo UDP socket dùng nhận RTP và bind vào rtpPort
+                self.rtpSocket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self.rtpSocket.bind(('', self.rtpPort))
+                self.rtpSocket.settimeout(0.5)  # timeout 0.5s như yêu cầu
+                
+                self.sendRtspRequest(SETUP)
+            except Exception as e:
+                tkinter.messagebox.Message(
+                    self.master,
+                    title="RTP Socket Error",
+                    message=f"Cannot bind RTP port {self.rtpPort}.\n{e}"
+                ).show()
 
     def handlerPlay(self):
         """Gửi yêu cầu PLAY."""
-        if self.state != READY:
-            return
+        if self.state == READY:
+            # Tạo thread mới
+            self.playEvent.set()
+            self.stopEvent.clear()
+            
+            # Chỉ tạo thread nếu chưa có hoặc đã chết
+            if self.listenThread is None or not self.listenThread.is_alive():
+                self.listenThread = threading.Thread(target=self.listenRtp)
+                self.listenThread.daemon = True
+                self.listenThread.start()
 
-        # Bắt đầu thread lắng nghe RTP nếu chưa chạy
-        if self.listenThread is None or not self.listenThread.is_alive():
-            self.listenThread = threading.Thread(target=self.listenRtp)
-            self.listenThread.daemon = True
-            self.listenThread.start()
-
-        self.sendRtspRequest(PLAY)
+            self.sendRtspRequest(PLAY)
 
     def handlerPause(self):
         """Gửi yêu cầu PAUSE."""
-        if self.state != PLAYING:
-            return
-        self.sendRtspRequest(PAUSE)
+        if self.state == PLAYING:
+            self.playEvent.clear()
+            self.sendRtspRequest(PAUSE)
 
     def handlerTeardown(self):
         """Gửi yêu cầu TEARDOWN."""
-        if self.state == INIT and self.sessionId == 0:
-            # Chưa SETUP mà đóng luôn cửa sổ
-            self.cleanup()
-            return
-
         self.sendRtspRequest(TEARDOWN)
-        self.teardownAcked = True  # báo cho thread listenRtp dừng
+        
+        self.stopEvent.set()
+        self.playEvent.clear()
+        
+        # Đóng socket RTP
+        try:
+            self.rtpSocket.close()
+        except:
+            pass
+            
+        # Đóng socket RTSP
+        try:
+             self.rtspSocket.shutdown(socket.SHUT_RDWR)
+             self.rtspSocket.close()
+        except:
+             pass
+        
+        self.master.destroy()
 
     def handler(self):
         """Xử lý khi người dùng tắt cửa sổ."""
@@ -160,45 +214,90 @@ class Client:
     # ================== Nhận dữ liệu RTP ==================
 
     def listenRtp(self):
-        """Nhận dữ liệu RTP từ server."""
-        while not self.teardownAcked:
-            if self.rtpSocket is None:
-                break
+            """Nhận dữ liệu RTP và tính toán thống kê (Stats)."""
+            current_frame_buffer = bytearray()
+            
+            # Ghi nhận thời gian bắt đầu
+            self.startTime = time.time()
+            
+            while True:
+                self.playEvent.wait()
+                if self.stopEvent.is_set(): break
+                
+                try:
+                    data, addr = self.rtpSocket.recvfrom(20480)
+                    if data:
+                        # 1. CẬP NHẬT THÔNG SỐ MẠNG (NETWORK USAGE)
+                        cur_time = time.time()
+                        self.totalBytes += len(data) # Cộng dồn số byte nhận được
+                        
+                        # Tính tốc độ (kbps) = (Tổng bit / Tổng thời gian) / 1000
+                        duration = cur_time - self.startTime
+                        if duration > 0:
+                            bitrate = (self.totalBytes * 8) / duration / 1000 
+                            # Cập nhật Label Băng thông
+                            self.lblRate.configure(text=f"Rate: {int(bitrate)} kbps")
+                            
+                            # Cập nhật Label Tổng dữ liệu (MB)
+                            mbytes = self.totalBytes / (1024 * 1024)
+                            self.lblBytes.configure(text=f"Data: {mbytes:.1f} MB")
+
+                        rtpPacket = RtpPacket()
+                        rtpPacket.decode(data)
+                        current_frame_buffer.extend(rtpPacket.getPayload())
+
+                        if rtpPacket.getMarker() == 1:
+                            currFrameNbr = rtpPacket.seqNum()
+                            
+                            # 2. CẬP NHẬT THÔNG SỐ MẤT GÓI (FRAME LOSS)
+                            # Nếu đây là frame mới
+                            if currFrameNbr > self.frameNbr:
+                                # Tính số frame bị nhảy cóc (Loss)
+                                # Ví dụ: Đang frame 5, nhận được frame 7 -> Mất frame 6
+                                diff = currFrameNbr - self.frameNbr
+                                if diff > 1:
+                                    self.lostFrames += (diff - 1)
+                                
+                                self.expectedFrames = currFrameNbr # Giả sử frame hiện tại là max
+                                
+                                # Tính tỉ lệ % mất
+                                if self.expectedFrames > 0:
+                                    loss_rate = (self.lostFrames / self.expectedFrames) * 100
+                                    self.lblLoss.configure(text=f"Loss: {loss_rate:.1f}%")
+
+                                self.frameNbr = currFrameNbr
+                                self.totalFrames += 1
+                                
+                                self.updateMovie(bytes(current_frame_buffer))
+                            
+                            current_frame_buffer = bytearray()
+                except:
+                    if self.playEvent.isSet(): break
+
+    def updateMovie(self, image_data):
+            """Cập nhật giao diện với frame mới (đã resize)."""
             try:
-                data, _ = self.rtpSocket.recvfrom(20480)  # buffer size
-                if not data:
-                    continue
-
-                rtpPacket = RtpPacket()
-                rtpPacket.decode(data)
-
-                currFrameNbr = rtpPacket.seqNum()
-                # Chỉ hiển thị frame mới (tránh lặp / trễ)
-                if currFrameNbr > self.frameNbr:
-                    self.frameNbr = currFrameNbr
-                    payload = rtpPacket.getPayload()
-                    self.updateMovie(payload)
-
-            except socket.timeout:
-                # Bình thường khi PAUSE hoặc mạng chậm
-                continue
-            except OSError:
-                # Socket đã đóng
-                break
+                # 1. Đọc ảnh từ dữ liệu nhận được
+                img = Image.open(io.BytesIO(image_data))
+                
+                # --- [FIX MẤT NÚT] THU NHỎ ẢNH ---
+                # Ép ảnh về chiều ngang 640px (hoặc 800px) để vừa cửa sổ
+                fixed_width = 640 
+                
+                # Tính toán chiều cao tự động theo tỷ lệ để ảnh không bị méo
+                width_percent = (fixed_width / float(img.size[0]))
+                height_size = int((float(img.size[1]) * float(width_percent)))
+                
+                # Thực hiện resize (LANCZOS giúp ảnh nét đẹp)
+                img = img.resize((fixed_width, height_size), Image.Resampling.LANCZOS)
+                # ---------------------------------
+                
+                # 2. Hiển thị lên giao diện
+                photo = ImageTk.PhotoImage(img)
+                self.label.configure(image=photo)
+                self.label.image = photo 
             except Exception:
-                # Có thể log thêm nếu cần
-                break
-
-    def updateMovie(self, image_data: bytes):
-        """Cập nhật giao diện với frame mới (JPEG bytes)."""
-        try:
-            img = Image.open(io.BytesIO(image_data))
-            photo = ImageTk.PhotoImage(img)
-            self.label.configure(image=photo)
-            self.label.image = photo  # giữ reference
-        except Exception:
-            # Bỏ qua frame bị lỗi
-            pass
+                pass
 
     # ================== RTSP ==================
 
@@ -214,6 +313,16 @@ class Client:
 
         # Tăng CSeq
         self.rtspSeq += 1
+
+        # --- [NÂNG CAO] CẬP NHẬT TÊN FILE NẾU CHỌN HD ---
+        if requestCode == SETUP:
+            try:
+                # Lấy tên file từ Radio Button
+                if self.resolution.get():
+                    self.fileName = self.resolution.get()
+            except:
+                pass 
+        # -----------------------------------------------
 
         request = ""
 
@@ -241,6 +350,10 @@ class Client:
         request += "\r\n"
 
         try:
+            # --- IN LOG CHUẨN ĐỀ BÀI (C: Client) ---
+            print('\n'.join(['C: ' + line for line in request.split('\n') if line]))
+            # ---------------------------------------
+            
             self.requestSent = requestCode
             self.rtspSocket.sendall(request.encode("utf-8"))
             self.recvRtspReply()
@@ -256,6 +369,10 @@ class Client:
             reply = reply.decode("utf-8")
         except Exception:
             return
+        
+        # --- IN LOG CHUẨN ĐỀ BÀI (S: Server) ---
+        print('\n'.join(['S: ' + line for line in reply.split('\n') if line]))
+        # ---------------------------------------
 
         # Chuẩn hoá và tách dòng
         lines = reply.replace('\r', '').split('\n')
@@ -280,20 +397,21 @@ class Client:
                             pass
                         break
                 self.state = READY
-                print("State -> READY")
+                # print("State -> READY")
 
             elif self.requestSent == PLAY:
                 self.state = PLAYING
-                print("State -> PLAYING")
+                # print("State -> PLAYING")
 
             elif self.requestSent == PAUSE:
                 self.state = READY
-                print("State -> READY")
+                # print("State -> READY")
 
             elif self.requestSent == TEARDOWN:
                 self.state = INIT
-                print("State -> INIT (teardown)")
-                self.cleanup()
+                # print("State -> INIT (teardown)")
+                # Không gọi self.cleanup() ở đây để tránh lỗi GUI, 
+                # việc đóng cửa sổ đã được xử lý ở handlerTeardown
 
         elif status_code == '404':
             tkinter.messagebox.Message(
@@ -308,28 +426,3 @@ class Client:
                 title="RTSP Error",
                 message="500 CONNECTION ERROR."
             ).show()
-
-    # ================== Dọn tài nguyên ==================
-
-    def cleanup(self):
-        """Đóng socket và huỷ GUI."""
-        self.teardownAcked = True
-
-        try:
-            if self.rtpSocket is not None:
-                self.rtpSocket.close()
-                self.rtpSocket = None
-        except Exception:
-            pass
-
-        try:
-            if self.rtspSocket is not None:
-                self.rtspSocket.close()
-                self.rtspSocket = None
-        except Exception:
-            pass
-
-        try:
-            self.master.destroy()
-        except Exception:
-            pass
